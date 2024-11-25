@@ -26,20 +26,19 @@ from shapely.geometry import shape, box, Polygon,Point
 from shapely import wkt
 from glob import glob
 
-from tifffile import imread
 from cytomine import Cytomine, models, CytomineJob
 from cytomine.models import Annotation, AnnotationTerm, AnnotationCollection, ImageInstanceCollection, Job, User, JobData, Project, ImageInstance, Property
 from cytomine.models.ontology import Ontology, OntologyCollection, Term, RelationTerm, TermCollection
 
 import torch
-# from torchvision.models import DenseNet
 import openvino as ov
 
-# import matplotlib.pyplot as plt
 import time
 import cv2
 import math
 import csv
+
+from io import BytesIO
 
 from argparse import ArgumentParser
 import json
@@ -162,25 +161,53 @@ def run(cyto_job, parameters):
         
         def process_cell(roi, roi_id, roi_location, id_image, confidence_threshold, label_to_term_id, working_path, project, is_algo):
             try:
+                imageinfo = ImageInstance(id=id_image, project=parameters.cytomine_id_project)
+                imageinfo.fetch()
+                wsi_width=imageinfo.width
+                wsi_height=imageinfo.height
                 roi_geometry = wkt.loads(roi_location)
-                roi_path = os.path.join(working_path, str(project.id), str(id_image))
-                os.makedirs(roi_path, exist_ok=True)
-                roi_png_filename = os.path.join(roi_path, f"{roi_id}.png")
-                roi.dump(dest_pattern=roi_png_filename,mask=True,alpha=not is_algo,increase_area=1.5)     
-                im = cv2.cvtColor(cv2.imread(roi_png_filename), cv2.COLOR_BGR2RGB)
-                im = cv2.resize(im, (224, 224))
-                arr_out = torch.from_numpy(im.transpose(2, 0, 1)).unsqueeze(0)
-
-                compiled_model, output_layer = get_compiled_model_and_output_layer()
-                output_batch = compiled_model([arr_out])[output_layer]
-                softmax_scores = softmax(output_batch[0])
-                max_confidence = np.max(softmax_scores)
-                pred_label = np.argmax(softmax_scores)
-                term_id = label_to_term_id.get(pred_label) if max_confidence >= confidence_threshold else parameters.cytomine_id_cell_term
-
-                if term_id:
-                    # Return annotation with prediction and predicted label
-                    return Annotation(location=roi_geometry.wkt, id_image=id_image, id_project=project.id, id_terms=[term_id]), pred_label
+                min_x=roi_geometry.bounds[0]
+                min_y=roi_geometry.bounds[1]
+                max_x=roi_geometry.bounds[2]
+                max_y=roi_geometry.bounds[3]    
+                roi_width=int(max_x - min_x)
+                roi_height=int(max_y - min_y)    
+                patch_x = int(min_x)
+                patch_y = int(wsi_height - max_y)
+    
+                # New dimensions with a 50% increase (blood model was trained with larger surrounding area)
+                new_width = int(roi_width * 1.5)
+                new_height = int(roi_height * 1.5)
+                adjust_x = (new_width - roi_width) / 2
+                adjust_y = (new_height - roi_height) / 2
+                new_min_x = max(min_x - adjust_x, 0)  # Ensure we don't go below 0
+                new_min_y = max(min_y - adjust_y, 0)  # Ensure we don't go below 0
+                new_max_x = min(max_x + adjust_x, wsi_width)  # Ensure we don't exceed image width
+                new_max_y = min(max_y + adjust_y, wsi_height)  # Ensure we don't exceed image height
+                patch_x = int(new_min_x)
+                patch_y = int(wsi_height - new_max_y)  # Flip Y-axis for bottom-left origin
+    
+                response = cyto_job.get_instance()._get(
+                    "{}/{}/window-{}-{}-{}-{}.{}".format("imageinstance", id_image, patch_x, patch_y, new_width, new_height, "png"), {}
+                )
+    
+                if response.status_code in [200, 304] and response.headers['Content-Type'] == 'image/png':
+                    image_bytes = BytesIO(response.content)
+                    image_array = np.asarray(bytearray(image_bytes.read()), dtype=np.uint8)
+                    im = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+                    im = cv2.resize(im, (224, 224))
+                    arr_out = torch.from_numpy(im.transpose(2, 0, 1)).unsqueeze(0)
+                    image_bytes.seek(0)                
+    
+                    compiled_model, output_layer = get_compiled_model_and_output_layer()
+                    output_batch = compiled_model([arr_out])[output_layer]
+                    softmax_scores = softmax(output_batch[0])
+                    max_confidence = np.max(softmax_scores)
+                    pred_label = np.argmax(softmax_scores)
+                    term_id = label_to_term_id.get(pred_label) if max_confidence >= confidence_threshold else parameters.cytomine_id_cell_term
+    
+                    if term_id:
+                        return Annotation(location=roi_geometry.wkt, id_image=id_image, id_project=project.id, id_terms=[term_id]), pred_label
 
             except Exception as e:
                 print(f"Error processing ROI {roi_id}: {e}")
